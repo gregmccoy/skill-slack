@@ -1,11 +1,11 @@
 from os.path import dirname
 
 from adapt.intent import IntentBuilder
+from mycroft.client.speech.main import handle_speak
 from mycroft.skills.core import MycroftSkill
 from mycroft.util.log import getLogger
 from mycroft.messagebus.message import Message
 import requests
-import operator
 import re
 import json
 import threading
@@ -16,10 +16,6 @@ __author__ = 'gregmccoy'
 
 LOGGER = getLogger(__name__)
 
-ENDPOINT = "https://{}/api/v1/messages"
-
-#EventBusEmitter = EventEmitter()
-
 class SlackSkill(MycroftSkill):
     def __init__(self):
         super(SlackSkill, self).__init__(name="SlackSkill")
@@ -29,10 +25,33 @@ class SlackSkill(MycroftSkill):
         self.slack = SlackClient(self.key)
 
 
+    def __exit__(self, exc_type, exc_value, traceback):
+        print("Cleaning up")
+        for thread in self.threads:
+            thread.exit()
+
+
     def initialize(self):
         send_message = IntentBuilder("SendSlackMessage")\
             .require("SendSlackMessage").build()
         self.register_intent(send_message, self.handle_send_message)
+
+        def slack_reply(message):
+            try:
+                text = message.data["utterance"]
+                self.slack.api_call(
+                  "chat.postMessage",
+                  channel=self.current_user,
+                  text=text
+                )
+            except Exception as e:
+                print("Error occured: " + str(e))
+
+        # Remove normal speech function
+        self.emitter.remove_all_listeners("speak")
+        self.emitter.on("speak", slack_reply)
+        self.live = True
+
         self.threads = []
         t = threading.Thread(target=self.listen)
         self.threads.append(t)
@@ -65,43 +84,37 @@ class SlackSkill(MycroftSkill):
     def listen(self):
         if self.slack.rtm_connect():
             user = self.slack.server.login_data["self"]["id"]
-            while True:
+            while self.live:
                 try:
                     message = self.slack.rtm_read()
                     if message:
-                        if message[0]["type"] == "message" and message[0]["user"] != user:
+                        if message[0]["type"] == "message":
                             text = message[0]["text"]
-                            print("---")
-                            print(text.strip())
-                            print("---")
-                            if user in text:
+                            if user in text or user in message[0]["channel"]:
                                 # if they tagged the bot in the message we want to remove that
                                 text = text.replace("<@" + user + ">", "")
-                            self.enclosure.ws.emit(Message("recognizer_loop:utterance", {'utterances': [text.strip()]}))
+                                self.current_user = message[0]["channel"]
+                                self.enclosure.ws.emit(Message("recognizer_loop:utterance", {'utterances': [text.strip()] }))
                 except Exception as e:
                     #Connection Problems trying again in 10 seconds
+                    print("Exception")
                     print(e)
-                    time.sleep(10)
+                    time.sleep(5)
                 time.sleep(1)
 
 
     def handle_send_message(self, message):
         utterance = message.data.get("utterance")
         utterance = utterance.split(" ")
-
-        # Clean up message
-        for index, word in enumerate(utterance):
-            if word in ["on slack", "in slack", "with slack", "slack message"]:
-                del utterance[index]
         utterance = " ".join(utterance)
 
         recipient = None
         content = None
 
         try:
-            match = re.search("(to|slack|message).*?(?= say|$)", utterance)
+            match = re.search("(to|slack|black|message).*?(?= say|$)", utterance)
             match_str = match.group(0)
-            for item in ["to ", "slack message ", "slack "]:
+            for item in ["to ", "slack message ", "slack ", "black ", "black message "]:
                 match_str = match_str.replace(item, "")
             recipient = match_str
 
@@ -147,5 +160,5 @@ class SlackSkill(MycroftSkill):
             self.speak("Could not find user or channel named {}".format(recipient))
 
 def create_skill():
-	return SlackSkill()
+    return SlackSkill()
 
